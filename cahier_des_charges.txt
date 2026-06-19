@@ -1,0 +1,312 @@
+# CAHIER DES CHARGES FONCTIONNEL ET TECHNIQUE (CdC)
+Projet : l'Antre  
+Rôles : Product Owner & Tech Lead  
+Cible : Équipe de Développement Full-Stack  
+
+---
+
+## 1. Introduction, Objectifs et Périmètre du projet
+
+### 1.1 Introduction
+L'application l'Antre est une plateforme mobile sociale permettant aux passionnés de pop-culture de centraliser, gérer et partager leurs collections et listes d'envies (wishlists) à travers quatre catégories majeures : Jeux vidéo, Mangas, Vinyles et Figurines Pop. Au-delà de la simple gestion d'inventaire, l'Antre se positionne comme un réseau social de niche favorisant les échanges directs entre collectionneurs grâce à une messagerie instantanée en temps réel.
+
+### 1.2 Objectifs du projet
+* Centralisation : Offrir un catalogue mondial unique alimenté par des API tierces et enrichi par la communauté.
+* Fidélisation & Engagement : Connecter les utilisateurs ayant des centres d'intérêt communs via un module social complet (système d'amis, messagerie).
+* Fiabilité des Données : Garantir la propreté du catalogue global grâce à un workflow strict de modération des fiches créées manuellement.
+* Robustesse Technique : Proposer une architecture mobile et backend hautement évolutive, capable de supporter une montée en charge sur le temps réel.
+
+### 1.3 Périmètre (MVP)
+* Application mobile iOS et Android (via Expo/React Native).
+* Système d'authentification sécurisé (JWT).
+* Moteur de recherche hybride (Texte & Code-barres).
+* Gestion fine des collections/wishlists avec confidentialité ajustable.
+* Messagerie privée (1v1) structurée pour le multi-utilisateur (évolutive groupe).
+* Système de signalement multi-cibles (utilisateurs, messages, produits).
+
+---
+
+## 2. Architecture Technique
+
+### 2.1 Front-end : Stratégie de Transition Expo vers React Native CLI
+Pour accélérer les phases de prototypage et de test, l'application est initialisée avec Expo. Cependant, afin de garantir l'absence de friction lors de l'éjection future vers React Native CLI (nécessaire pour des optimisations natives avancées), les directives suivantes doivent être respectées :
+
+* Isolation du Matériel (Caméra) : L'usage d'expo-camera doit être encapsulé de manière hermétique dans un service ou un composant d'interface abstrait.
+* Pattern d'Abstraction :
+  src/services/camera/
+  ├── CameraService.ts (Interface/Contrat de service)
+  ├── ExpoCameraService.tsx (Implémentation actuelle via Expo)
+  └── index.ts (Point d'entrée exportant l'implémentation)
+  En production, seul le fichier ExpoCameraService.tsx sera remplacé par une implémentation basée sur react-native-vision-camera, sans impacter le reste du code de l'application.
+
+### 2.2 Back-end : Structure NestJS & Gestion du Temps Réel
+Le backend est développé sous NestJS en respectant une architecture modulaire stricte. Chaque domaine fonctionnel possède son propre module (ex: AuthModule, UsersModule, ProductsModule, ChatModule, ReportsModule).
+
+#### Passerelle WebSocket (NestJS Gateway)
+La couche temps réel est portée par @nestjs/websockets avec le driver socket.io.
+* Authentification WS : Un Guard d'authentification (WsJwtAuthGuard) doit intercepter la connexion initiale (connection) en extrayant le token JWT des headers ou des query params. Si le token est invalide, la connexion est immédiatement rejetée.
+* Gestion des Salles (Rooms) : Chaque utilisateur connecté rejoint automatiquement une room portant son ID unique (user_userId). Lors de l'ouverture d'une conversation, l'utilisateur rejoint une room dédiée à la conversation (chat_conversationId).
+
+---
+
+## 3. Spécifications Fonctionnelles & User Stories
+
+### 3.1 Flux de Recherche & Persistance (Flux Critique)
+[Utilisateur lance une recherche (Scan/Texte)]
+                   │
+                   ▼
+       ┌───────────────────────┐
+       │  Recherche en BDD     │
+       │   (Table Products)    │
+       └───────────┬───────────┘
+                   │
+           Produit trouvé ?
+           ├── Oui ───────────────> [Associer à la Collection/Wishlist]
+           └── Non ─┐
+                    ▼
+       ┌───────────────────────┐
+       │ Recherche API Externe │
+       │ (IGDB, Discogs, etc.) │
+       └───────────┬───────────┘
+                   │
+           Produit trouvé ?
+           ├── Oui ───────────────> [Créer automatiquement dans Products] ──> [Associer]
+           └── Non ─┐
+                    ▼
+       ┌───────────────────────┐
+       │  Création Manuelle    │
+       │   (Statut: PENDING)   │
+       └───────────────────────┘
+
+#### US 1 : Recherche et Ajout Automatique
+* En tant que Collectionneur  
+* Je veux scanner un code-barres ou tape le nom d'un produit  
+* Afin de l'ajouter instantanément à ma collection sans saisir les détails manuellement.  
+* Critères d'acceptation :
+    1. Le système interroge en priorité la table locale Products.
+    2. En cas d'échec, le système appelle l'API correspondante (ex: Discogs pour les vinyles, IGDB pour les jeux).
+    3. Si l'API renvoie un résultat, la fiche est créée en BDD avec le statut VERIFIED. Elle devient immédiatement disponible pour toute la communauté.
+    4. Le produit est lié à la collection de l'utilisateur avec l'état renseigné (Neuf, Très bon état, etc.).
+
+#### US 2 : Création d'une Fiche Manuelle (Workflow d'Exception)
+* En tant que Collectionneur possédant un objet rare  
+* Je veux créer manuellement une fiche produit lorsque la recherche automatique échoue  
+* Afin de pouvoir tout de même l'ajouter à mon inventaire d'exposition.  
+* Critères d'acceptation :
+    1. Accessible uniquement si la recherche BDD + API n'a rien donné.
+    2. L'utilisateur doit obligatoirement fournir : Titre, Catégorie, et au moins une Photo.
+    3. Le produit est inséré en BDD avec le statut PENDING.
+    4. Le produit apparaît dans la collection de l'auteur, mais reste invisible via le moteur de recherche global des autres utilisateurs tant qu'il n'est pas validé par un modérateur.
+
+### 3.2 Module Social & Cycle de Vie d'un Message
+
+#### US 3 : Évolutivité de la Messagerie (Focus Tech)
+* En tant que Développeur  
+* Je veux que l'architecture de la messagerie s'appuie sur des tables de liaison (Participants)  
+* Afin de passer d'un modèle de chat 1v1 à un modèle de groupe (multi-participants) via une simple évolution de logique applicative, sans altérer le schéma de la BDD.
+
+#### Cycle de vie d'un message :
+1. Émission : Le client émet l'événement sendMessage via WebSocket avec le payload { conversationId, content }.
+2. Persistance : Le Gateway reçoit l'événement, valide l'appartenance de l'utilisateur à la conversation, et enregistre le message en BDD via Prisma avec le statut SENT.
+3. Diffusion : Le serveur diffuse le message sur la room chat_conversationId via un .to(conversationId).emit('newMessage', message).
+4. Accusé de réception : Le client distant reçoit le message et émet un acquittement (readMessage), mettant à jour le statut du message en READ en BDD.
+
+---
+
+## 4. Modèle de Données (Schéma Prisma)
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum ProductStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum Visibility {
+  PUBLIC
+  FRIENDS
+  PRIVATE
+}
+
+enum ReportStatus {
+  PENDING
+  REVIEWED
+  RESOLVED
+}
+
+enum ReportType {
+  MESSAGE
+  CONVERSATION
+  USER
+  PRODUCT
+}
+
+model User {
+  id              String                   @id @default(uuid())
+  email           String                   @unique
+  username        String                   @unique
+  password        String
+  role            Role                     @default(USER)
+  createdAt       DateTime                 @default(now())
+  updatedAt       DateTime                 @updatedAt
+  
+  collections     UserProduct[]
+  participants    ConversationParticipant[]
+  messagesSent    Message[]
+  reportsFiled    Report[]                 @relation("ReportAuthor")
+  reportsAgainst  Report[]                 @relation("ReportTargetUser")
+  
+  friendsRequested Friendship[]            @relation("FriendRequestSender")
+  friendsReceived  Friendship[]            @relation("FriendRequestReceiver")
+}
+
+model Friendship {
+  id         String   @id @default(uuid())
+  senderId   String
+  receiverId String
+  isAccepted Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  sender     User     @relation("FriendRequestSender", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver   User     @relation("FriendRequestReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  @@unique([senderId, receiverId])
+}
+
+model Product {
+  id          String        @id @default(uuid())
+  title       String
+  category    String        
+  barcode     String?       @unique
+  imageUrl    String?
+  description String?
+  status      ProductStatus @default(VERIFIED)
+  createdAt   DateTime      @default(now())
+  
+  userLinks   UserProduct[]
+  reports     Report[]
+}
+
+model UserProduct {
+  id           String     @id @default(uuid())
+  userId       String
+  productId    String
+  visibility   Visibility @default(PUBLIC)
+  condition    String?    
+  isWishlist   Boolean    @default(false)
+  
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product      Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, productId, isWishlist])
+}
+
+model Conversation {
+  id        String                    @id @default(uuid())
+  title     String?                   
+  isGroup   Boolean                   @default(false)
+  createdAt DateTime                  @default(now())
+  
+  participants ConversationParticipant[]
+  messages     Message[]
+  reports      Report[]
+}
+
+model ConversationParticipant {
+  id             String       @id @default(uuid())
+  conversationId String
+  userId         String
+  joinedAt       DateTime     @default(now())
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, userId])
+}
+
+model Message {
+  id             String       @id @default(uuid())
+  conversationId String
+  senderId       String
+  content        String
+  isRead         Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender         User         @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  reports        Report[]
+}
+
+model Report {
+  id             String       @id @default(uuid())
+  type           ReportType
+  reason         String
+  status         ReportStatus @default(PENDING)
+  authorId       String
+  createdAt      DateTime     @default(now())
+
+  targetUserId           String?
+  targetMessageId        String?
+  targetConversationId   String?
+  targetProductId        String?
+
+  author                 User          @relation("ReportAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  targetUser             User?         @relation("ReportTargetUser", fields: [targetUserId], references: [id], onDelete: Cascade)
+  targetMessage          Message?      @relation(fields: [targetMessageId], references: [id], onDelete: Cascade)
+  targetConversation     Conversation? @relation(fields: [targetConversationId], references: [id], onDelete: Cascade)
+  targetProduct          Product?      @relation(fields: [targetProductId], references: [id], onDelete: Cascade)
+}
+
+---
+
+## 5. Spécifications des API & Événements WebSockets
+
+### 5.1 Endpoints REST (Sécurisés par Bearer JWT)
+- POST /api/v1/auth/register -> Inscription d'un utilisateur | Payload: { email, username, password }
+- POST /api/v1/auth/login -> Connexion (Retourne un JWT) | Payload: { email, password }
+- GET /api/v1/products/search -> Recherche locale + fallback externe | Query: ?q=text ou ?barcode=123
+- POST /api/v1/products/manual -> Création d'une fiche manuelle (PENDING) | Payload: { title, category, imageUrl, description }
+- POST /api/v1/collections/add -> Ajouter un produit à sa collection/wishlist | Payload: { productId, visibility, isWishlist, condition }
+- POST /api/v1/reports -> Soumettre un signalement d'élément | Payload: { type, reason, targetId }
+
+### 5.2 Événements WebSockets (Passerelle Chat)
+Émis par le Client :
+- joinConversation : L'utilisateur rejoint la room d'un chat | Payload: { conversationId: string }
+- sendMessage : Envoi d'un nouveau message en temps réel | Payload: { conversationId: string, content: string }
+- markAsRead : Déclenche l'accusé de lecture | Payload: { conversationId: string, messageId: string }
+
+Émis par le Serveur :
+- newMessage : Poussé aux participants connectés | Payload: { id: string, content: string, senderId: string, createdAt: Date }
+- messageRead : Notifie l'expéditeur que son message a été lu | Payload: { messageId: string, conversationId: string }
+
+---
+
+## 6. Sécurité, Modération et Contraintes d'acceptation
+
+### 6.1 Sécurité & RGPD
+* Mots de passe : Hachage obligatoire via bcrypt (salt rounds: 10) avant stockage.
+* Transmissions : Chiffrement via HTTPS pour l'API REST et WSS pour les WebSockets.
+* RGPD : Endpoint DELETE /api/v1/users/me pour suppression complète des données de l'utilisateur (onDelete: Cascade).
+
+### 6.2 Modération (Workflow Back-office)
+* Tout signalement (Report) créé apparaît instantanément dans le tableau de bord avec le statut PENDING.
+* Le passage au statut RESOLVED nécessite l'enregistrement de l'ID du modérateur et l'action associée (suppression, bannissement, validation/rejet).
+
+### 6.3 Contraintes d'acceptation et de validation (QA)
+* Performance : Temps de réponse de la recherche locale < 150ms.
+* Couverture de tests : Services critiques couverts à hauteur de 80% minimum.
+* Gestion des erreurs : Interception des erreurs d'API tierces par un ExceptionFilter global.
